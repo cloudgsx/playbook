@@ -1,0 +1,112 @@
+---
+- name: Deploy AWX on k3d cluster
+  hosts: all
+  become: yes
+  vars:
+    default_cluster_name: "awx-cluster-demo"
+    default_host_port: 8080
+    cluster_name: "{{ awx_cluster_name | default(default_cluster_name) }}"
+    host_port: "{{ awx_host_port | default(default_host_port) }}"
+
+  tasks:
+    - name: Create and execute AWX deployment script
+      block:
+        - name: Create deployment script
+          ansible.builtin.copy:
+            dest: /tmp/deploy_awx.sh
+            content: |
+              #!/bin/bash
+              set -e
+
+              echo "🧪 Using cluster name: {{ cluster_name }}"
+              echo "🔌 Mapping NodePort 30000 to host port: {{ host_port }}"
+
+              # Delete existing cluster if exists
+              echo "🧹 Deleting existing k3d cluster '{{ cluster_name }}' (if any)..."
+              k3d cluster delete "{{ cluster_name }}" || true
+
+              # Create new cluster
+              echo "🚀 Creating new k3d cluster '{{ cluster_name }}'..."
+              k3d cluster create "{{ cluster_name }}" \
+                --port "0.0.0.0:{{ host_port }}:30000@loadbalancer" \
+                --volume /data:/var/lib/rancher/k3s/storage
+
+              # Wait for kubeconfig
+              export KUBECONFIG="$(k3d kubeconfig write "{{ cluster_name }}")"
+
+              # Helm setup
+              echo "📦 Adding AWX Operator Helm repo..."
+              helm repo add awx-operator https://ansible-community.github.io/awx-operator-helm/ || true
+              helm repo update
+
+              # Install AWX Operator
+              echo "📥 Installing AWX Operator using Helm..."
+              helm upgrade --install awx-operator awx-operator/awx-operator -n awx --create-namespace
+
+              # Apply AWX manifest
+              echo "🛠 Applying AWX instance manifest..."
+              kubectl apply -f - <<EOF
+              apiVersion: awx.ansible.com/v1beta1
+              kind: AWX
+              metadata:
+                name: awx-demo
+                namespace: awx
+              spec:
+                service_type: nodeport
+                nodeport_port: 30000
+              EOF
+
+              # Wait for password
+              echo "🔐 Waiting for AWX admin password..."
+              while ! kubectl get secret awx-demo-admin-password -n awx &> /dev/null; do
+                sleep 2
+              done
+
+              echo "✅ AWX setup complete!"
+              echo "👤 Username: admin"
+              echo "🔑 Password: $(kubectl get secret awx-demo-admin-password -n awx -o jsonpath='{.data.password}' | base64 --decode)"
+              echo "🌐 Access AWX at: http://localhost:{{ host_port }}"
+
+              # Create systemd service
+              echo "📌 Creating systemd service to auto-start k3d cluster..."
+              cat > "/etc/systemd/system/k3d-{{ cluster_name }}.service" <<EOF
+              [Unit]
+              Description=k3d {{ cluster_name }} cluster
+              After=docker.service
+
+              [Service]
+              ExecStart=/usr/local/bin/k3d cluster start {{ cluster_name }}
+              ExecStop=/usr/local/bin/k3d cluster stop {{ cluster_name }}
+              Restart=always
+
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+
+              systemctl daemon-reload
+              systemctl enable "k3d-{{ cluster_name }}"
+            mode: '0755'
+
+        - name: Execute deployment script
+          ansible.builtin.command: /bin/bash /tmp/deploy_awx.sh
+          register: awx_deployment
+          async: 600
+          poll: 0
+
+        - name: Wait for AWX to become ready
+          ansible.builtin.shell: |
+            kubectl get pods -n awx -l "app.kubernetes.io/managed-by=awx-operator" -o jsonpath='{.items[*].status.phase}' | grep -q Running
+          register: awx_ready
+          until: awx_ready.rc == 0
+          retries: 30
+          delay: 10
+          ignore_errors: yes
+
+    - name: Show AWX access information
+      ansible.builtin.debug:
+        msg: |
+          AWX deployment completed!
+          Username: admin
+          Password: "{{ awx_deployment.stdout_lines | select('match', 'Password: .*') | first | regex_replace('.*Password: (.*)', '\\1') }}"
+          Access URL: http://{{ ansible_host }}:{{ host_port }}
+      when: awx_ready.rc == 0
