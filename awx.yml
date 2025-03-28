@@ -102,11 +102,15 @@
           delay: 10
           ignore_errors: yes
 
-    - name: Show AWX access information
-      ansible.builtin.debug:
-        msg: |
-          AWX deployment completed!
-          Username: admin
-          Password: "{{ awx_deployment.stdout_lines | select('match', 'Password: .*') | first | regex_replace('.*Password: (.*)', '\\1') }}"
-          Access URL: http://{{ ansible_host }}:{{ host_port }}
-      when: awx_ready.rc == 0
+        - name: Show AWX access information
+          ansible.builtin.debug:
+            msg: |
+              AWX deployment completed!
+              Username: admin
+              {% if awx_deployment is defined and awx_deployment.stdout is defined %}
+              Password: "{{ (awx_deployment.stdout | regex_findall('Password: (.*)'))[0] | default('NOT_FOUND') }}"
+              {% else %}
+              Password: "Check /tmp/deploy_awx.sh output manually"
+              {% endif %}
+              Access URL: http://{{ ansible_host }}:{{ host_port }}
+          when: awx_ready.rc == 0
